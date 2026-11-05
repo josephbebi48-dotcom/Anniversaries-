@@ -437,6 +437,7 @@ function Cake({ onDone }) {
         <div className="plate" />
       </div>
       {!out && <button className="cta" onClick={blow}>Souffler les bougies 💨</button>}
+      {!out && <p className="mic-nb">NB : utilise le micro de ton téléphone pour souffler les bougies (autorise l’accès) 🎤</p>}
     </div>)
 }
 
