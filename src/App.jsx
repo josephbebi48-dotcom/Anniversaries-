@@ -20,6 +20,33 @@ const ANIMALS = ['🐘', '🦁', '🐻', '🐯', '🦒', '🐼']
 const ICONS = ['🎈', '🎂', '🎁', '✨', '💜', '🌸', '🎉', '🦋', '🎶', '🌅']
 /* ============================== */
 
+let sharedAudioCtx = null
+function getAudioContext() {
+  const Ctx = typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext)
+  if (!Ctx) return null
+  if (!sharedAudioCtx || sharedAudioCtx.state === 'closed') {
+    try { sharedAudioCtx = new Ctx() } catch { return null }
+  }
+  return sharedAudioCtx
+}
+function unlockAudio() {
+  const ctx = getAudioContext()
+  if (ctx && ctx.state === 'suspended') ctx.resume().catch(() => {})
+  return ctx
+}
+
+const MIC_MESSAGES = {
+  requesting: 'Autorise le micro pour souffler les bougies…',
+  denied: 'Accès au micro refusé — utilise le bouton ci-dessous 💨',
+  busy: 'Micro déjà utilisé par une autre app — utilise le bouton ci-dessous.',
+  notfound: 'Aucun microphone détecté — utilise le bouton ci-dessous.',
+  insecure: 'Le micro nécessite HTTPS — utilise le bouton ci-dessous.',
+  unsupported: 'Micro non disponible sur ce navigateur — utilise le bouton ci-dessous.',
+  error: 'Le micro n’a pas pu démarrer — utilise le bouton ci-dessous.',
+  ended: 'Le micro s’est arrêté — utilise le bouton ci-dessous.',
+  paused: 'Touche l’écran pour réactiver le micro.',
+}
+
 const MELODY = [[392,.75],[392,.25],[440,1],[392,1],[523.25,1],[493.88,2],[392,.75],[392,.25],[440,1],[392,1],[587.33,1],[523.25,2],[392,.75],[392,.25],[783.99,1],[659.25,1],[523.25,1],[493.88,1],[440,1],[698.46,.75],[698.46,.25],[659.25,1],[523.25,1],[587.33,1],[523.25,2]]
 
 function useMusic() {
@@ -117,34 +144,291 @@ function Quiz() {
 
 function Cake({ onDone }) {
   const [out, setOut] = useState(false)
+  const [micState, setMicState] = useState('idle')
   const done = useRef(false)
+  const outro = useRef(null)
+  const stopMic = useRef(null)
+  const blowRef = useRef(null)
+  const onDoneRef = useRef(onDone)
+  useEffect(() => { onDoneRef.current = onDone })
+
   const blow = () => {
     if (done.current) return
-    done.current = true; setOut(true); setTimeout(onDone, 2600)
+    done.current = true
+    stopMic.current?.()
+    setOut(true)
+    outro.current = setTimeout(() => onDoneRef.current?.(), 2600)
   }
+  blowRef.current = blow
+
   useEffect(() => {
-    let stopped = false, stream, ctx, raf
-    navigator.mediaDevices?.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false } }).then((st) => {
-      if (stopped) return st.getTracks().forEach((t) => t.stop())
-      stream = st; ctx = new (window.AudioContext || window.webkitAudioContext)()
-      const an = ctx.createAnalyser(); an.fftSize = 512
-      ctx.createMediaStreamSource(st).connect(an)
-      const buf = new Uint8Array(an.fftSize); let n = 0
-      const tick = () => {
-        an.getByteTimeDomainData(buf)
-        let sum = 0; for (const v of buf) { const x = (v - 128) / 128; sum += x * x }
-        n = Math.sqrt(sum / buf.length) > 0.2 ? n + 1 : 0
-        if (n > 8) return blow()
-        raf = requestAnimationFrame(tick)
+    let destroyed = false
+    let blocked = false
+    let starting = false
+    let stream = null
+    let ctx = null
+    let source = null
+    let analyser = null
+    let sink = null
+    let raf = null
+    let lastFrame = 0
+    let calibrating = true
+    let calStart = 0
+    let calSamples = []
+    let noiseFloor = 0.01
+    let above = false
+    let aboveStart = 0
+    let aboveFrames = 0
+    let timeF = null
+    let timeB = null
+    let freqB = null
+    let useFloat = false
+    let loBin = 1
+    let hiBin = 1
+
+    const status = (s) => { if (!destroyed) setMicState(s) }
+    const clearLoop = () => { if (raf) cancelAnimationFrame(raf); raf = null }
+
+    const teardown = () => {
+      clearLoop()
+      try { source?.disconnect() } catch {}
+      try { analyser?.disconnect() } catch {}
+      try { sink?.disconnect() } catch {}
+      if (stream) {
+        stream.getTracks().forEach((t) => { t.onended = null; try { t.stop() } catch {} })
       }
-      tick()
-    }).catch(() => {})
-    return () => { stopped = true; cancelAnimationFrame(raf); stream?.getTracks().forEach((t) => t.stop()); ctx?.close() }
+      stream = null; source = null; analyser = null; sink = null
+      timeF = null; timeB = null; freqB = null
+      if (ctx && ctx === sharedAudioCtx && ctx.state === 'running') ctx.suspend().catch(() => {})
+    }
+
+    const shutdown = () => {
+      if (destroyed) return
+      destroyed = true
+      document.removeEventListener('visibilitychange', onVisibility)
+      document.removeEventListener('pointerdown', onGesture, true)
+      document.removeEventListener('touchstart', onGesture, true)
+      window.removeEventListener('pageshow', onPageShow)
+      teardown()
+    }
+    stopMic.current = shutdown
+
+    function startLoop() {
+      if (destroyed || raf || !analyser) return
+      raf = requestAnimationFrame(tick)
+    }
+
+    function tick(ts) {
+      raf = null
+      if (destroyed) return
+      if (ts - lastFrame < 33) { raf = requestAnimationFrame(tick); return }
+      lastFrame = ts
+      if (!analyser) return
+      if (!ctx || ctx.state !== 'running') {
+        if (ctx) ctx.resume().then(() => {
+          if (destroyed) return
+          status('listening')
+          if (!raf) startLoop()
+        }).catch(() => status('paused'))
+        return
+      }
+      process(ts)
+      if (!destroyed) raf = requestAnimationFrame(tick)
+    }
+
+    function sampleAt(i) {
+      return useFloat ? timeF[i] : (timeB[i] - 128) / 128
+    }
+
+    function maxPeriodicity() {
+      const n = analyser.fftSize
+      const minLag = Math.max(1, Math.floor(ctx.sampleRate / 1200))
+      const maxLag = Math.min(Math.floor(ctx.sampleRate / 80), Math.floor(n / 2))
+      let best = 0
+      for (let lag = minLag; lag <= maxLag; lag += 2) {
+        let dot = 0, e1 = 0, e2 = 0
+        for (let i = 1; i + lag < n; i += 2) {
+          const a = sampleAt(i) - sampleAt(i - 1)
+          const b = sampleAt(i + lag) - sampleAt(i + lag - 1)
+          dot += a * b; e1 += a * a; e2 += b * b
+        }
+        const corr = dot / (Math.sqrt(e1 * e2) + 1e-9)
+        if (corr > best) best = corr
+        if (best > 0.5) break
+      }
+      return best
+    }
+
+    function process(ts) {
+      const n = analyser.fftSize
+      if (useFloat) analyser.getFloatTimeDomainData(timeF)
+      else analyser.getByteTimeDomainData(timeB)
+      let sum = 0
+      for (let i = 0; i < n; i++) {
+        const x = sampleAt(i)
+        sum += x * x
+      }
+      const rms = Math.sqrt(sum / n)
+
+      if (calibrating) {
+        calSamples.push(rms)
+        if (ts - calStart >= 550 && calSamples.length >= 10) {
+          const sorted = calSamples.slice().sort((a, b) => a - b)
+          noiseFloor = Math.max(0.004, Math.min(sorted[Math.floor(sorted.length / 2)], 0.15))
+          calibrating = false
+        }
+        return
+      }
+
+      const threshold = Math.max(0.009, noiseFloor * 1.35 + 0.006)
+      if (rms <= threshold) {
+        above = false; aboveFrames = 0
+        noiseFloor = Math.min(0.2, noiseFloor * 0.96 + rms * 0.04)
+        return
+      }
+
+      analyser.getByteFrequencyData(freqB)
+      let magSum = 0, logSum = 0, peak = 0
+      const count = Math.max(1, hiBin - loBin + 1)
+      for (let i = loBin; i <= hiBin; i++) {
+        const m = freqB[i] / 255
+        magSum += m
+        logSum += Math.log(m + 0.001)
+        if (m > peak) peak = m
+      }
+      const mean = magSum / count
+      const flatness = mean > 0 ? Math.exp(logSum / count) / mean : 0
+      const peakRatio = mean > 0 ? peak / mean : 99
+      const breathLike = flatness > 0.1 && peakRatio < 16 && maxPeriodicity() < 0.45
+
+      if (breathLike) {
+        if (!above) { above = true; aboveStart = ts; aboveFrames = 0 }
+        aboveFrames++
+        if (ts - aboveStart >= 200 && aboveFrames >= 5) {
+          blowRef.current?.()
+          return
+        }
+      } else {
+        above = false; aboveFrames = 0
+        noiseFloor = Math.min(0.2, noiseFloor * 0.992 + rms * 0.008)
+      }
+    }
+
+    async function startMic() {
+      if (destroyed || done.current || starting || blocked) return
+      starting = true
+      status('requesting')
+      try {
+        if (window.isSecureContext === false) { blocked = true; status('insecure'); return }
+        if (!navigator.mediaDevices?.getUserMedia) { blocked = true; status('unsupported'); return }
+
+        let st
+        try {
+          st = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: false,
+              autoGainControl: false,
+              channelCount: 1,
+            },
+          })
+        } catch (err) {
+          if (destroyed) return
+          const name = err && err.name
+          if (name === 'NotAllowedError' || name === 'SecurityError') { blocked = true; status('denied') }
+          else if (name === 'NotFoundError' || name === 'DevicesNotFoundError' || name === 'OverconstrainedError') { blocked = true; status('notfound') }
+          else if (name === 'NotReadableError' || name === 'AbortError' || name === 'TrackStartError') { status('busy') }
+          else { status('error') }
+          return
+        }
+
+        if (destroyed || done.current) { st.getTracks().forEach((t) => t.stop()); return }
+        stream = st
+        const track = st.getAudioTracks?.()[0] || st.getTracks()[0]
+        if (!track) { blocked = true; teardown(); status('notfound'); return }
+        track.onended = () => {
+          if (destroyed || done.current) return
+          teardown(); status('ended')
+        }
+
+        ctx = getAudioContext()
+        if (!ctx) { blocked = true; teardown(); status('unsupported'); return }
+        try { if (ctx.state === 'suspended') await ctx.resume() } catch {}
+
+        source = ctx.createMediaStreamSource(st)
+        analyser = ctx.createAnalyser()
+        analyser.fftSize = 1024
+        analyser.smoothingTimeConstant = 0.2
+        sink = ctx.createGain()
+        sink.gain.value = 0
+        source.connect(analyser)
+        analyser.connect(sink)
+        sink.connect(ctx.destination)
+
+        const binHz = ctx.sampleRate / analyser.fftSize
+        loBin = Math.max(1, Math.floor(120 / binHz))
+        hiBin = Math.min(analyser.frequencyBinCount - 1, Math.ceil(4000 / binHz))
+        useFloat = typeof analyser.getFloatTimeDomainData === 'function'
+        if (useFloat) timeF = new Float32Array(analyser.fftSize)
+        else timeB = new Uint8Array(analyser.fftSize)
+        freqB = new Uint8Array(analyser.frequencyBinCount)
+
+        calibrating = true; calStart = performance.now(); calSamples = []
+        above = false; aboveFrames = 0
+        status(ctx.state === 'running' ? 'listening' : 'paused')
+        startLoop()
+      } catch {
+        if (!destroyed) status('error')
+      } finally {
+        starting = false
+      }
+    }
+
+    function onVisibility() {
+      if (destroyed || done.current) return
+      if (document.hidden) { teardown(); return }
+      const track = stream?.getAudioTracks?.()[0] || stream?.getTracks?.()[0]
+      if (!stream || !track || track.readyState === 'ended') {
+        teardown()
+        if (!blocked) startMic()
+        return
+      }
+      if (ctx && ctx.state === 'suspended') ctx.resume().catch(() => {})
+      status('listening')
+      startLoop()
+    }
+
+    function onGesture() {
+      if (destroyed || done.current) return
+      const c = ctx || getAudioContext()
+      if (c && c.state === 'suspended') c.resume().catch(() => {})
+      if (analyser) startLoop()
+      else if (!blocked) startMic()
+    }
+
+    function onPageShow() {
+      if (!destroyed && !document.hidden) onVisibility()
+    }
+
+    document.addEventListener('visibilitychange', onVisibility)
+    document.addEventListener('pointerdown', onGesture, true)
+    document.addEventListener('touchstart', onGesture, true)
+    window.addEventListener('pageshow', onPageShow)
+    startMic()
+
+    return () => {
+      clearTimeout(outro.current)
+      shutdown()
+      stopMic.current = null
+    }
   }, [])
+
+  const micNote = !out && MIC_MESSAGES[micState]
   return (
     <div className={'cakepage' + (out ? ' out' : '')}>
       <Floaters n={10} />
       <h2 className="cakehint">{out ? 'Bravo, fais un vœu ! ✨' : 'Fais un vœu, puis souffle les bougies 🎤'}</h2>
+      {micNote && <p className="micnote" role="status" aria-live="polite">{micNote}</p>}
       <div className="cake" onClick={blow}>
         <div className="candles">{[0, 1, 2, 3, 4].map((i) => (
           <div key={i} className="candle" style={{ '--i': i }}><i className="flame" /><i className="smoke" /></div>))}
@@ -170,6 +454,7 @@ function Gallery() {
           <span className="animal">{ANIMALS[i]}</span>
           <figure style={{ '--r': (i % 2 ? 3 : -3) + 'deg', '--d': i * 0.5 + 's', '--fd': i * 0.7 + 1.8 + 's' }}>
             <img src={src} alt="" loading="lazy" />
+            <figcaption className="polaroid-caption"><span aria-hidden="true">⭐</span> Joyeux anniversaire ! <span aria-hidden="true">⭐</span></figcaption>
           </figure>
         </div>))}
     </section>)
@@ -184,7 +469,7 @@ export default function App() {
     <div className="gate"><Floaters n={12} />
       <div className="big bounce">🎁</div>
       <h1>Une surprise t’attend</h1>
-      <button className="cta glow" onClick={() => { setStage('cake'); music.play() }}>Ouvrir la surprise</button>
+      <button className="cta glow" onClick={() => { unlockAudio(); setStage('cake'); music.play() }}>Ouvrir la surprise</button>
     </div>)
   return (
     <main>
@@ -206,3 +491,5 @@ export default function App() {
       <footer>Fait avec ♥ pour toi</footer>
     </main>)
 }
+
+
