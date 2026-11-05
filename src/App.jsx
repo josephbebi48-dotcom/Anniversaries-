@@ -460,6 +460,47 @@ function Gallery() {
     </section>)
 }
 
+function WishLetter() {
+  const [open, setOpen] = useState(false)
+  const sparks = useMemo(() => Array.from({ length: 18 }, (_, i) => ({
+    e: ['✨', '⭐', '💫', '🌟', '✦'][i % 5],
+    l: 4 + Math.random() * 92,
+    t: 12 + Math.random() * 62,
+    d: (1 + Math.random() * 1.3).toFixed(2) + 's',
+    dl: (Math.random() * 0.6).toFixed(2) + 's',
+    s: (0.7 + Math.random() * 0.9).toFixed(2) + 'rem',
+  })), [])
+  return (
+    <section className={'letter' + (open ? ' open' : '')}>
+      <div className="letter-halo" aria-hidden="true" />
+      <div className="letter-sparks" aria-hidden="true">
+        {sparks.map((s, i) => (
+          <i key={i} style={{ left: s.l + '%', top: s.t + '%', fontSize: s.s, '--dur': s.d, '--dl': s.dl }}>{s.e}</i>
+        ))}
+      </div>
+      <div className="letter-paper">
+        <article className="parchment" id="wish-letter">
+          <div className="parchment-inner">
+            <span className="parchment-crest" aria-hidden="true">✦</span>
+            <p className="parchment-title">Un mot pour toi</p>
+            {MESSAGE.map((t, i) => <p className="parchment-text" key={i}>{t}</p>)}
+            <p className="parchment-sign">Avec toute ma sincérité, {FROM} 💜</p>
+          </div>
+        </article>
+      </div>
+      <div className="envelope">
+        <div className="env-back" aria-hidden="true" />
+        <div className="env-flap" aria-hidden="true" />
+        <div className="env-front" aria-hidden="true" />
+        <span className="env-seal" aria-hidden="true">♥</span>
+        <button type="button" className="cta env-btn" onClick={() => setOpen(true)} disabled={open} aria-expanded={open} aria-controls="wish-letter">
+          Ouvrir l’enveloppe 💌
+        </button>
+      </div>
+    </section>
+  )
+}
+
 export default function App() {
   const [stage, setStage] = useState('gate')
   const music = useMusic()
@@ -484,9 +525,7 @@ export default function App() {
         <div className="scroll">⌄</div>
       </section>
       <Gallery />
-      <section className="msg">
-        {MESSAGE.map((t, i) => <p key={i}>{t}</p>)}
-      </section>
+      <WishLetter />
       <section className="quizwrap"><h2>Un petit quiz pour toi 🎯</h2><Quiz /></section>
       <footer>Fait avec ♥ pour toi</footer>
     </main>)
